@@ -1,0 +1,1262 @@
+'use strict';
+
+const apiai = require('apiai');
+const config = require('./config');
+const express = require('express');
+const crypto = require('crypto');
+const bodyParser = require('body-parser');
+const request = require('request');
+const app = express();
+const path = require('path');
+const uuid = require('uuid');
+
+// Messenger API parameters
+if (!config.FB_PAGE_TOKEN) {
+	throw new Error('missing FB_PAGE_TOKEN');
+}
+if (!config.FB_VERIFY_TOKEN) {
+	throw new Error('missing FB_VERIFY_TOKEN');
+}
+if (!config.API_AI_CLIENT_ACCESS_TOKEN) {
+	throw new Error('missing API_AI_CLIENT_ACCESS_TOKEN');
+}
+if (!config.FB_APP_SECRET) {
+	throw new Error('missing FB_APP_SECRET');
+}
+if (!config.SERVER_URL) { //used for ink to static files
+	throw new Error('missing SERVER_URL');
+}
+if (!config.SENDGRID_API_KEY) { //used for Sendgrid email
+	throw new Error('missing SENDGRID_API_KEY');
+}
+if (!config.EMAIL_FROM) {
+	throw new Error('missing EMAIL_FROM');
+}
+if (!config.EMAIL_TO) { //used for ink to static files
+	throw new Error('missing EMAIL_TO');
+}
+
+if (!config.WEATHER_API_KEY) { //weather api key
+	throw new Error('missing WEATHER_API_KEY');
+}
+
+if (!config.NEWS_API_KEY) { //NEWS api key
+	throw new Error('missing NEWS_API_KEY');
+}
+
+
+
+app.set('port', (process.env.PORT || 5000))
+
+//verify request came from facebook
+app.use(bodyParser.json({
+	verify: verifyRequestSignature
+}));
+
+//serve static files in the public directory
+app.use(express.static('public'));
+
+
+app.use("/style",  express.static(__dirname + '/tic-tac-toe-minimax-master/style'));
+app.use("/js", express.static(__dirname + '/tic-tac-toe-minimax-master/js'));
+app.use("/images",  express.static(__dirname + '/tic-tac-toe-minimax-master/images'));
+// Process application/x-www-form-urlencoded
+app.use(bodyParser.urlencoded({
+	extended: false
+}))
+
+// Process application/json
+app.use(bodyParser.json())
+
+
+
+
+const apiAiService = apiai(config.API_AI_CLIENT_ACCESS_TOKEN, {
+	language: "en",
+	requestSource: "fb"
+});
+const sessionIds = new Map();
+
+app.get('/tic-tac-toe', function (req, res) {
+      res.sendfile(__dirname + '/tic-tac-toe-minimax-master/');
+});
+// Index route
+app.get('/', function (req, res) {
+	res.send('CooperBot is online and active');
+
+
+})
+
+// for Facebook verification
+app.get('/webhook/', function (req, res) {
+	console.log("request");
+	if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === config.FB_VERIFY_TOKEN) {
+		res.status(200).send(req.query['hub.challenge']);
+	} else {
+		console.error("Failed validation. Make sure the validation tokens match.");
+		res.sendStatus(403);
+	}
+})
+
+/*
+ * All callbacks for Messenger are POST-ed. They will be sent to the same
+ * webhook. Be sure to subscribe your app to your page to receive callbacks
+ * for your page.
+ * https://developers.facebook.com/docs/messenger-platform/product-overview/setup#subscribe_app
+ *
+ */
+app.post('/webhook/', function (req, res) {
+	var data = req.body;
+	console.log(JSON.stringify(data));
+
+
+
+	// Make sure this is a page subscription
+	if (data.object == 'page') {
+		// Iterate over each entry
+		// There may be multiple if batched
+		data.entry.forEach(function (pageEntry) {
+			var pageID = pageEntry.id;
+			var timeOfEvent = pageEntry.time;
+
+			// Iterate over each messaging event
+			pageEntry.messaging.forEach(function (messagingEvent) {
+				if (messagingEvent.optin) {
+					receivedAuthentication(messagingEvent);
+				} else if (messagingEvent.message) {
+					receivedMessage(messagingEvent);
+				} else if (messagingEvent.delivery) {
+					receivedDeliveryConfirmation(messagingEvent);
+				} else if (messagingEvent.postback) {
+					receivedPostback(messagingEvent);
+				} else if (messagingEvent.read) {
+					receivedMessageRead(messagingEvent);
+				} else if (messagingEvent.account_linking) {
+					receivedAccountLink(messagingEvent);
+				} else {
+					console.log("Webhook received unknown messagingEvent: ", messagingEvent);
+				}
+			});
+		});
+
+		// Assume all went well.
+		// You must send back a 200, within 20 seconds
+		res.sendStatus(200);
+	}
+});
+
+
+
+
+
+function receivedMessage(event) {
+
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+	var timeOfMessage = event.timestamp;
+	var message = event.message;
+
+	if (!sessionIds.has(senderID)) {
+ 		sessionIds.set(senderID, uuid.v1());
+ 	}
+
+	console.log("Received message for user %d and page %d at %d with message:",
+		senderID, recipientID, timeOfMessage);
+	console.log(JSON.stringify(message));
+
+	var isEcho = message.is_echo;
+	var messageId = message.mid;
+	var appId = message.app_id;
+	var metadata = message.metadata;
+
+	// You may get a text or attachment but not both
+	var messageText = message.text;
+	var messageAttachments = message.attachments;
+	var quickReply = message.quick_reply;
+
+	if (isEcho) {
+		handleEcho(messageId, appId, metadata);
+		return;
+	} else if (quickReply) {
+		handleQuickReply(senderID, quickReply, messageId);
+		return;
+	}
+
+
+	if (messageText) {
+		//send message to api.ai
+		sendToApiAi(senderID, messageText);
+	} else if (messageAttachments) {
+		handleMessageAttachments(messageAttachments, senderID);
+	}
+}
+
+
+function handleMessageAttachments(messageAttachments, senderID){
+	//for now just reply
+	sendTextMessage(senderID, "Attachment received. Thank you.");
+}
+
+function handleQuickReply(senderID, quickReply, messageId) {
+	var quickReplyPayload = quickReply.payload;
+	console.log("Quick reply for message %s with payload %s", messageId, quickReplyPayload);
+	//send payload to api.ai
+	sendToApiAi(senderID, quickReplyPayload);
+}
+
+//https://developers.facebook.com/docs/messenger-platform/webhook-reference/message-echo
+function handleEcho(messageId, appId, metadata) {
+	// Just logging message echoes to console
+	console.log("Received echo for message %s and app %d with metadata %s", messageId, appId, metadata);
+}
+
+function handleApiAiAction(sender, action, responseText, contexts, parameters) {
+
+	switch (action) {
+		case "get-game":
+		var button = [
+	 {
+		 type:"web_url",
+		 url:"https://aqueous-dusk-53300.herokuapp.com/tic-tac-toe",
+		 title:"Follow me here",
+		 webview_height_ratio: "full"
+	 }
+ ];
+
+ 		let reply = `${responseText}`;
+    //sendTextMessage(sender,reply);
+    sendButtonMessage(sender, reply, button);
+
+		break;
+		case "get-joke":
+		var request = require('request');
+		 request({
+			 url:'http://api.icndb.com/jokes/random',
+
+		 },
+		   function(error, response, body){
+         if(!error && response.statusCode == 200) {
+ 					let joke = JSON.parse(body);
+					 //console.log("data joke is ",joke["value"]);
+						var newMessageData = joke["value"]["joke"];
+						let reply = `${newMessageData}`;
+						sendTextMessage(sender,reply);
+
+ 				} else {
+           console.error(response.error);
+         }
+     });
+
+		break;
+		case "get-tech-news":
+		var request = require('request');
+		 request({
+			 url:'https://newsapi.org/v1/articles?source=techcrunch&sortBy=latest',
+			 qs:{
+				 apiKey: config.NEWS_API_KEY
+			 },
+		 },
+		   function(error, response, body){
+         if(!error && response.statusCode == 200) {
+ 					let techNews = JSON.parse(body);
+					//console.log("data to wrk with",news["source"]);
+						var newMessageData = techNews["articles"].map((techStory)=>{
+
+								return {
+									 title:techStory["title"],
+			  					 subtitle: techStory["description"],
+			  					 item_url: techStory["url"],
+			  					 image_url: techStory["urlToImage"],
+									 buttons: [{
+										type: "web_url",
+										url: techStory["url"],
+										title: "Open Web URL"
+									}]
+
+
+			  					 }
+								 });
+						//console.log("newMessageData is", newMessageData);
+						let reply = `${responseText} from ${techNews["source"]}`;
+						sendTextMessage(sender,reply);
+
+						sendGenericMessage(sender, newMessageData);
+ 				} else {
+           console.error(response.error);
+         }
+     });
+
+	 break;
+
+
+		case "get-sports-news":
+		var request = require('request');
+		 request({
+			 url:'https://newsapi.org/v1/articles?source=espn&sortBy=top',
+			 qs:{
+				 apiKey: config.NEWS_API_KEY
+			 },
+		 },
+		   function(error, response, body){
+         if(!error && response.statusCode == 200) {
+ 					let sportNews = JSON.parse(body);
+					//console.log("data to wrk with",news["source"]);
+						var newMessageData = sportNews["articles"].map((sportStory)=>{
+
+								return {
+									 title:sportStory["title"],
+			  					 subtitle: sportStory["description"],
+			  					 item_url: sportStory["url"],
+			  					 image_url: sportStory["urlToImage"],
+									 buttons: [{
+										type: "web_url",
+										url: sportStory["url"],
+										title: "Open Web URL"
+									}]
+
+
+			  					 }
+								 });
+						//console.log("newMessageData is", newMessageData);
+						let reply = `${responseText} from ${sportNews["source"]}`;
+						sendTextMessage(sender,reply);
+
+						sendGenericMessage(sender, newMessageData);
+ 				} else {
+           console.error(response.error);
+         }
+     });
+
+	 break;
+
+		case "get-current-news":
+		var request = require('request');
+		 request({
+			 url:'https://newsapi.org/v1/articles?source=associated-press&sortBy=top',
+			 qs:{
+				 apiKey: config.NEWS_API_KEY
+			 },
+		 },
+		   function(error, response, body){
+         if(!error && response.statusCode == 200) {
+ 					let news = JSON.parse(body);
+					//console.log("data to wrk with",news["source"]);
+						var newMessageData = news["articles"].map((newsStory)=>{
+
+								return {
+									 title:newsStory["title"],
+			  					 subtitle: newsStory["description"],
+			  					 item_url: newsStory["url"],
+			  					 image_url: newsStory["urlToImage"],
+									 buttons: [{
+										type: "web_url",
+										url: newsStory["url"],
+										title: "Open Web URL"
+									}]
+
+
+			  					 }
+								 });
+						//console.log("newMessageData is", newMessageData);
+						let reply = `${responseText} from the ${news["source"]}`;
+						sendTextMessage(sender,reply);
+
+						sendGenericMessage(sender, newMessageData);
+ 				} else {
+           console.error(response.error);
+         }
+     });
+
+	 break;
+		case "get-current-weather":
+
+		if(parameters.hasOwnProperty("geo-city") && parameters["geo-city"] != ''){
+    var request = require('request');
+
+    request({
+        url: 'http://api.openweathermap.org/data/2.5/weather', //URL to hit
+        qs: {
+					appid: config.WEATHER_API_KEY,
+					q: parameters["geo-city"]
+				},
+    }, function(error, response, body){
+        if(!error && response.statusCode == 200) {
+					let weather = JSON.parse(body);
+					if(weather.hasOwnProperty("weather")){
+						sendTextMessage(sender,responseText);
+						//console.log("checkpoint weather",weather["main"]["temp_max"]);
+						let highTemp = Math.round(convertKelvinToF(weather["main"]["temp_max"]));
+						let lowTemp = Math.round(convertKelvinToF(weather["main"]["temp_min"]));
+						let currentTemp = Math.round(convertKelvinToF(weather["main"]["temp"]));
+						let wDescribe = weather["weather"][0]["description"];
+						//let reply = `${responseText}  ${weather["weather"][0]["description"]} \nWith highs around //${highTemp} and lows around ${lowTemp}`;
+						if(wDescribe.includes("clear")){
+							var weatherReply= [{
+							title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+							subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+							image_url: config.SERVER_URL + "/assets/clearPic.jpg",
+						}];
+						if(currentTemp>80){
+							var reply = "Looks like it's going to be a clear sunny day";
+							sendTextMessage(sender,reply);
+							var asset="nice_weather.gif";
+							sendGifMessage(recipientId,asset);
+						}
+						else if(currentTemp<70 && currentTemp > 55){
+							var reply = "Good day to wear a hoodie";
+							sendTextMessage(sender,reply);
+						}
+          	//sendTextMessage(sender,reply);
+					}
+					else if(wDescribe.includes("rain")){
+						var weatherReply= [{
+						title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+						subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+						image_url: config.SERVER_URL + "/assets/rainPic.jpg",
+					}];
+
+
+					if(currentTemp<60){
+						let reply = "Set your alarm to snooze, it's going to be a rainy one...zzz";
+						sendTextMessage(sender,reply);
+						var asset="lazy_cat.gif";
+						sendGifMessage(sender,asset);
+					}
+					else{
+						let reply = "Don't forget an umbrella";
+						sendTextMessage(sender,reply);
+					}
+				}
+				else if(wDescribe.includes("mist")){
+					var weatherReply= [{
+					title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+					subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+					image_url: config.SERVER_URL + "/assets/mistPic.jpg",
+				}];
+
+				if(currentTemp<50){
+					let reply = "Set your alarm to snooze, it's going to be a rainy one...zzz";
+					sendTextMessage(sender,reply);
+					var asset="lazy_cat.gif";
+					sendGifMessage(sender,asset);
+				}
+
+			}
+			else if(wDescribe.includes("fog")){
+				var weatherReply= [{
+				title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+				subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+				image_url: config.SERVER_URL + "/assets/mistPic.jpg",
+			}];
+
+			if(currentTemp<50){
+				let reply = "Not sure if those are clouds or fog";
+				sendTextMessage(sender,reply);
+			}
+
+		}
+			else if(wDescribe.includes("snow")){
+				var weatherReply= [{
+				title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+				subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+				image_url: config.SERVER_URL + "/assets/snowPic.jpg",
+			}];
+			let reply = "Winter is coming";
+			sendTextMessage(sender,reply);
+		}
+		else if(wDescribe.includes("cloud")){
+			var weatherReply= [{
+			title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+			subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+			image_url: config.SERVER_URL + "/assets/cloudPic.jpg",
+		}];
+
+		if(currentTemp>80){
+			var reply = "Warm weather is nice weather";
+			sendTextMessage(sender,reply);
+			//var asset="sunny_day.gif";
+			//sendGifMessage(sender,asset);
+		}
+		else if(currentTemp<70 && currentTemp > 55){
+			var reply = "Good day to wear a hoodie";
+			sendTextMessage(sender,reply);
+		}
+	}
+	else if(wDescribe.includes("haze")){
+		var weatherReply= [{
+		title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+		subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+		image_url: config.SERVER_URL + "/assets/hazePic.jpg",
+	}];
+	let reply = "Today's forecast pollution";
+	sendTextMessage(sender,reply);
+}
+
+	else{
+		var weatherReply= [{
+		title: `${parameters["geo-city"]}\n${currentTemp}°\n${wDescribe}`,
+		subtitle: `With Highs around ${highTemp} and Lows around ${lowTemp}`,
+		image_url: config.SERVER_URL + "/assets/cloudPic.jpg",
+	}];
+	}
+
+	     sendGenericMessage(sender, weatherReply);
+
+					}
+					else{
+						sendTextMessage(sender,
+							`No weather forecast available for ${parameters["geo-city"]}`);
+					}
+        } else {
+          console.error(response.error);
+        }
+    });
+
+		}
+		else{
+			sendTextMessage(sender, responseText);
+		}
+
+			break;
+		default:
+			//unhandled action, just send back the text
+			sendTextMessage(sender, responseText);
+	}
+}
+
+function handleApiAiResponse(sender, response) {
+	let responseText = response.result.fulfillment.speech;
+	let responseData = response.result.fulfillment.data;
+	let action = response.result.action;
+	let contexts = response.result.contexts;
+	let parameters = response.result.parameters;
+
+	console.log("responseText: " + responseText);
+	console.log("responseData: " + responseData);
+	console.log("action: " + action);
+	sendTypingOff(sender);
+
+
+	if (responseText == '' && !isDefined(action)) {
+		//api ai could not evaluate input.
+		console.log('Unknown query' + response.result.resolvedQuery);
+		sendTextMessage(senderID, "I'm not sure what you want. Can you be more specific?");
+	} else if (isDefined(action)) {
+		handleApiAiAction(sender, action, responseText, contexts, parameters);
+	} else if (isDefined(responseData) && isDefined(responseData.facebook)) {
+		try {
+			console.log('Response as formatted message' + responseData.facebook);
+			sendTextMessage(sender, responseData.facebook);
+		} catch (err) {
+			sendTextMessage(sender, err.message);
+		}
+	} else if (isDefined(responseText)) {
+		console.log('Respond as text message');
+		sendTextMessage(sender, responseText);
+	}
+}
+
+function sendToApiAi(sender, text) {
+	console.log("sendToApiAi: " + text);
+	sendTypingOn(sender);
+	let apiaiRequest = apiAiService.textRequest(text, {
+		sessionId: sessionIds.get(sender)
+	});
+
+	apiaiRequest.on('response', (response) => {
+		if (isDefined(response.result)) {
+			handleApiAiResponse(sender, response);
+		}
+	});
+
+	apiaiRequest.on('error', (error) => console.error(error));
+	apiaiRequest.end();
+}
+
+
+
+function sendTextMessage(recipientId, text) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			text: text
+		}
+	}
+	callSendAPI(messageData);
+}
+
+/*
+ * Send an image using the Send API.
+ *
+ */
+function sendImageMessage(recipientId) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "image",
+				payload: {
+					url: config.SERVER_URL + "/assets/rift.png"
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a Gif using the Send API.
+ *
+ */
+function sendGifMessage(recipientId,asset) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "image",
+				payload: {
+					//url: config.SERVER_URL + "/assets/instagram_logo.gif"
+					url: config.SERVER_URL + "/assets/" + asset
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send audio using the Send API.
+ *
+ */
+function sendAudioMessage(recipientId) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "audio",
+				payload: {
+					url: config.SERVER_URL + "/assets/sample.mp3"
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a video using the Send API.
+ * example videoName: "/assets/allofus480.mov"
+ */
+function sendVideoMessage(recipientId, videoName) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "video",
+				payload: {
+					url: config.SERVER_URL + videoName
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a video using the Send API.
+ * example fileName: fileName"/assets/test.txt"
+ */
+function sendFileMessage(recipientId, fileName) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "file",
+				payload: {
+					url: config.SERVER_URL + fileName
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+
+
+/*
+ * Send a button message using the Send API.
+ *
+ */
+function sendButtonMessage(recipientId, text, buttons) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "template",
+				payload: {
+					template_type: "button",
+					text: text,
+					buttons: buttons
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+function convertKelvinToF(numberToConvert){
+	return numberToConvert * (9/5) - 459.67;
+}
+
+/*
+ * Send a Structured Message (Generic Message type) using the Send API.
+ * elements example:
+ * [{
+ * title: "rift",
+ * subtitle: "Next-generation virtual reality",
+ * item_url: "https://www.oculus.com/en-us/rift/",
+ * image_url: config.SERVER_URL + "/assets/rift.png",
+ * buttons: [{
+ * type: "web_url",
+ * url: "https://www.oculus.com/en-us/rift/",
+ * title: "Open Web URL"
+ * }, {
+ * type: "postback",
+ * title: "Call Postback",
+ * payload: "Payload for first bubble",
+ * }],
+ * }, {
+ * title: "touch",
+ * subtitle: "Your Hands, Now in VR",
+ * item_url: "https://www.oculus.com/en-us/touch/",
+ * image_url: config.SERVER_URL + "/assets/touch.png",
+ * buttons: [{
+ * type: "web_url",
+ * url: "https://www.oculus.com/en-us/touch/",
+ * title: "Open Web URL"
+ * }, {
+ * type: "postback",
+ * title: "Call Postback",
+ * payload: "Payload for second bubble",
+ * }]
+ * }]
+ *
+ *
+ * OR
+ *
+ * [
+ *  {
+ * "title": "Classic White T-Shirt",
+ * "subtitle": "Soft white cotton t-shirt is back in style",
+ * "item_url": "https://petersapparel.parseapp.com/view_item?item_id=100",
+ * "image_url": "http://petersapparel.parseapp.com/img/item100-thumb.png",
+ * "buttons": [
+ *  {
+ * "type": "web_url",
+ * "url": "https://petersapparel.parseapp.com/view_item?item_id=100",
+ * "title": "View Item"
+ * },
+ * {
+ * "type": "web_url",
+ * "url": "https://petersapparel.parseapp.com/buy_item?item_id=100",
+ * "title": "Buy Item"
+ * },
+ * {
+ * "type": "postback",
+ * "title": "Bookmark Item",
+ * "payload": "USER_DEFINED_PAYLOAD_FOR_ITEM100"
+ * }
+ * ]
+ * },
+ * {
+ * "title": "Classic Grey T-Shirt",
+ * "subtitle": "Soft gray cotton t-shirt is back in style",
+ * "image_url": "http://petersapparel.parseapp.com/img/item101-thumb.png",
+ * "item_url": "https://petersapparel.parseapp.com/view_item?item_id=101",
+ * "buttons": [
+ * {
+ * "type": "web_url",
+ * "url": "https://petersapparel.parseapp.com/view_item?item_id=101",
+ * "title": "View Item"
+ * },
+ * {
+ * "type": "web_url",
+ * "url": "https://petersapparel.parseapp.com/buy_item?item_id=101",
+ * "title": "Buy Item"
+ * },
+ * {
+ * "type": "postback",
+ * "title": "Bookmark Item",
+ * "payload": "USER_DEFINED_PAYLOAD_FOR_ITEM101"
+ * }
+ * ]
+ * }
+ * ]
+ *
+ */
+function sendGenericMessage(recipientId, elements) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "template",
+				payload: {
+					template_type: "generic",
+					elements: elements
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a receipt message using the Send API.
+ * example:
+ * 	recipient_name: "Peter Chang",
+ * 	currency: "USD",
+ * 	payment_method: "Visa 1234",
+ * 	timestamp: "1428444852",
+ * 	elements: [{
+ * 	title: "Oculus Rift",
+ * 	subtitle: "Includes: headset, sensor, remote",
+ * 	quantity: 1,
+ * 	price: 599.00,
+ * 	currency: "USD",
+ * 	image_url: config.SERVER_URL + "/assets/riftsq.png"
+ * 	}, {
+ * 	title: "Samsung Gear VR",
+ * 	subtitle: "Frost White",
+ * 	quantity: 1,
+ * 	price: 99.99,
+ * 	currency: "USD",
+ * 	image_url: config.SERVER_URL + "/assets/gearvrsq.png"
+ * 	}],
+ * 	address: {
+ * 	street_1: "1 Hacker Way",
+ * 	street_2: "",
+ * 	city: "Menlo Park",
+ * 	postal_code: "94025",
+ * 	state: "CA",
+ * 	country: "US"
+ * 	},
+ * 	summary: {
+ * 	subtotal: 698.99,
+ * 	shipping_cost: 20.00,
+ * 	total_tax: 57.67,
+ * 	total_cost: 626.66
+ * 	},
+ * 	adjustments: [{
+ * 	name: "New Customer Discount",
+ * 	amount: -50
+ * 	}, {
+ * 	name: "$100 Off Coupon",
+ * 	amount: -100
+ * 	}]
+ */
+function sendReceiptMessage(recipientId, recipient_name, currency, payment_method,
+							timestamp, elements, address, summary, adjustments) {
+	// Generate a random receipt ID as the API requires a unique ID
+	var receiptId = "order" + Math.floor(Math.random() * 1000);
+
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "template",
+				payload: {
+					template_type: "receipt",
+					recipient_name: recipient_name,
+					order_number: receiptId,
+					currency: currency,
+					payment_method: payment_method,
+					timestamp: timestamp,
+					elements: elements,
+					address: address,
+					summary: summary,
+					adjustments: adjustments
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a message with Quick Reply buttons.
+ *
+ */
+function sendQuickReply(recipientId, text, replies, metadata) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			text: text,
+			metadata: isDefined(metadata)?metadata:'',
+			quick_replies: replies
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a read receipt to indicate the message has been read
+ *
+ */
+function sendReadReceipt(recipientId) {
+	console.log("Sending a read receipt to mark message as seen");
+
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		sender_action: "mark_seen"
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Turn typing indicator on
+ *
+ */
+function sendTypingOn(recipientId) {
+	console.log("Turning typing indicator on");
+
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		sender_action: "typing_on"
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Turn typing indicator off
+ *
+ */
+function sendTypingOff(recipientId) {
+	console.log("Turning typing indicator off");
+
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		sender_action: "typing_off"
+	};
+
+	callSendAPI(messageData);
+}
+
+/*
+ * Send a message with the account linking call-to-action
+ *
+ */
+function sendAccountLinking(recipientId) {
+	var messageData = {
+		recipient: {
+			id: recipientId
+		},
+		message: {
+			attachment: {
+				type: "template",
+				payload: {
+					template_type: "button",
+					text: "Welcome. Link your account.",
+					buttons: [{
+						type: "account_link",
+						url: config.SERVER_URL + "/authorize"
+          }]
+				}
+			}
+		}
+	};
+
+	callSendAPI(messageData);
+}
+
+
+function greetUserText(userId) {
+	//first read user firstname
+	request({
+		uri: 'https://graph.facebook.com/v2.7/' + userId,
+		qs: {
+			access_token: config.FB_PAGE_TOKEN
+		}
+
+	}, function (error, response, body) {
+		if (!error && response.statusCode == 200) {
+
+			var user = JSON.parse(body);
+			console.log("getUserData:" + user);
+			if (user.first_name) {
+				console.log("FB user: %s %s, %s",
+					user.first_name, user.last_name, user.gender);
+
+				sendTextMessage(userId, "Welcome " + user.first_name + '!');
+			} else {
+				console.log("Cannot get data for fb user with id",
+					userId);
+			}
+		} else {
+			console.error(response.error);
+		}
+
+	});
+}
+
+/*
+ * Call the Send API. The message data goes in the body. If successful, we'll
+ * get the message id in a response
+ *
+ */
+function callSendAPI(messageData) {
+	request({
+		uri: 'https://graph.facebook.com/v2.6/me/messages',
+		qs: {
+			access_token: config.FB_PAGE_TOKEN
+		},
+		method: 'POST',
+		json: messageData
+
+	}, function (error, response, body) {
+		if (!error && response.statusCode == 200) {
+			var recipientId = body.recipient_id;
+			var messageId = body.message_id;
+
+			if (messageId) {
+				console.log("Successfully sent message with id %s to recipient %s",
+					messageId, recipientId);
+			} else {
+				console.log("Successfully called Send API for recipient %s",
+					recipientId);
+			}
+		} else {
+			console.error(response.error);
+		}
+	});
+}
+
+
+
+/*
+ * Postback Event
+ *
+ * This event is called when a postback is tapped on a Structured Message.
+ * https://developers.facebook.com/docs/messenger-platform/webhook-reference/postback-received
+ *
+ */
+function receivedPostback(event) {
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+	var timeOfPostback = event.timestamp;
+
+	// The 'payload' param is a developer-defined field which is set in a postback
+	// button for Structured Messages.
+	var payload = event.postback.payload;
+
+	switch (payload) {
+		default:
+			//unindentified payload
+			sendTextMessage(senderID, "I'm not sure what you want. Can you be more specific?");
+			break;
+
+	}
+	console.log("payload" + payload);
+	console.log("Received postback for user %d and page %d with payload '%s' " +
+		"at %d", senderID, recipientID, payload, timeOfPostback);
+
+}
+
+
+/*
+ * Message Read Event
+ *
+ * This event is called when a previously-sent message has been read.
+ * https://developers.facebook.com/docs/messenger-platform/webhook-reference/message-read
+ *
+ */
+function receivedMessageRead(event) {
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+
+	// All messages before watermark (a timestamp) or sequence have been seen.
+	var watermark = event.read.watermark;
+	var sequenceNumber = event.read.seq;
+
+	console.log("Received message read event for watermark %d and sequence " +
+		"number %d", watermark, sequenceNumber);
+}
+
+/*
+ * Account Link Event
+ *
+ * This event is called when the Link Account or UnLink Account action has been
+ * tapped.
+ * https://developers.facebook.com/docs/messenger-platform/webhook-reference/account-linking
+ *
+ */
+function receivedAccountLink(event) {
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+
+	var status = event.account_linking.status;
+	var authCode = event.account_linking.authorization_code;
+
+	console.log("Received account link event with for user %d with status %s " +
+		"and auth code %s ", senderID, status, authCode);
+}
+
+/*
+ * Delivery Confirmation Event
+ *
+ * This event is sent to confirm the delivery of a message. Read more about
+ * these fields at https://developers.facebook.com/docs/messenger-platform/webhook-reference/message-delivered
+ *
+ */
+function receivedDeliveryConfirmation(event) {
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+	var delivery = event.delivery;
+	var messageIDs = delivery.mids;
+	var watermark = delivery.watermark;
+	var sequenceNumber = delivery.seq;
+
+	if (messageIDs) {
+		messageIDs.forEach(function (messageID) {
+			console.log("Received delivery confirmation for message ID: %s",
+				messageID);
+		});
+	}
+
+	console.log("All message before %d were delivered.", watermark);
+}
+
+/*
+ * Authorization Event
+ *
+ * The value for 'optin.ref' is defined in the entry point. For the "Send to
+ * Messenger" plugin, it is the 'data-ref' field. Read more at
+ * https://developers.facebook.com/docs/messenger-platform/webhook-reference/authentication
+ *
+ */
+function receivedAuthentication(event) {
+	var senderID = event.sender.id;
+	var recipientID = event.recipient.id;
+	var timeOfAuth = event.timestamp;
+
+	// The 'ref' field is set in the 'Send to Messenger' plugin, in the 'data-ref'
+	// The developer can set this to an arbitrary value to associate the
+	// authentication callback with the 'Send to Messenger' click event. This is
+	// a way to do account linking when the user clicks the 'Send to Messenger'
+	// plugin.
+	var passThroughParam = event.optin.ref;
+
+	console.log("Received authentication for user %d and page %d with pass " +
+		"through param '%s' at %d", senderID, recipientID, passThroughParam,
+		timeOfAuth);
+
+	// When an authentication is received, we'll send a message back to the sender
+	// to let them know it was successful.
+	sendTextMessage(senderID, "Authentication successful");
+}
+
+/*
+ * Verify that the callback came from Facebook. Using the App Secret from
+ * the App Dashboard, we can verify the signature that is sent with each
+ * callback in the x-hub-signature field, located in the header.
+ *
+ * https://developers.facebook.com/docs/graph-api/webhooks#setup
+ *
+ */
+function verifyRequestSignature(req, res, buf) {
+	var signature = req.headers["x-hub-signature"];
+
+	if (!signature) {
+		throw new Error('Couldn\'t validate the signature.');
+	} else {
+		var elements = signature.split('=');
+		var method = elements[0];
+		var signatureHash = elements[1];
+
+		var expectedHash = crypto.createHmac('sha1', config.FB_APP_SECRET)
+			.update(buf)
+			.digest('hex');
+
+		if (signatureHash != expectedHash) {
+			throw new Error("Couldn't validate the request signature.");
+		}
+	}
+}
+function sendEmail (subject,content){
+	// using SendGrid's v3 Node.js Library
+// https://github.com/sendgrid/sendgrid-nodejs
+var helper = require('sendgrid').mail;
+
+var from_email = new helper.Email(config.EMAIL_FROM);
+var to_email = new helper.Email(config.EMAIL_TO);
+var subject = subject;
+var content = new helper.Content("text/html", content);
+var mail = new helper.Mail(from_email, subject, to_email, content);
+
+var sg = require('sendgrid')(config.SENDGRID_API_KEY);
+var request = sg.emptyRequest({
+  method: 'POST',
+  path: '/v3/mail/send',
+  body: mail.toJSON()
+});
+
+sg.API(request, function(error, response) {
+  console.log(response.statusCode);
+  console.log(response.body);
+  console.log(response.headers);
+});
+
+}
+
+function isDefined(obj) {
+	if (typeof obj == 'undefined') {
+		return false;
+	}
+
+	if (!obj) {
+		return false;
+	}
+
+	return obj != null;
+}
+
+// Spin up the server
+app.listen(app.get('port'), function () {
+	console.log('running on port', app.get('port'))
+})
